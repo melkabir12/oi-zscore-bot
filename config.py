@@ -85,3 +85,19 @@ REST_HOSTS = {
     "okx": ["https://www.okx.com"],
     "bitget": ["https://api.bitget.com"],
 }
+
+# ── Proxy sortant (par exchange) ────────────────────────────────────
+# Binance (451 = blocage géographique) et Bybit (403 Cloudflare) sont
+# bloqués depuis l'IP Railway par défaut. On route UNIQUEMENT ces deux
+# exchanges via un proxy si une URL est fournie. Format attendu :
+#   http://user:password@host:port
+# ou
+#   http://host:port   (proxy sans authentification)
+#
+# Laisser vide ("") = pas de proxy, comportement inchangé (accès direct).
+# OKX et Bitget ne sont volontairement PAS concernés : ils fonctionnent
+# déjà en direct, inutile de les faire passer par le proxy.
+PROXY_URLS = {
+    "binance": os.environ.get("BINANCE_PROXY_URL", ""),
+    "bybit": os.environ.get("BYBIT_PROXY_URL", ""),
+}
