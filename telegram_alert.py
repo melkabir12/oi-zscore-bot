@@ -2,12 +2,33 @@
 Envoi de messages Telegram (alertes + notifications de statut).
 """
 import logging
+import math
 
 import requests
 
 import config
 
 log = logging.getLogger("telegram")
+
+
+def zscore_to_score100(z: float) -> float:
+    """
+    Convertit un Z-score combiné BRUT (non borné, peut dépasser 100 sur un
+    marché très calme suivi d'un pic brutal) en un score normalisé 0-100,
+    dans le même esprit que la colonne "Score/100" du rapport PDF de
+    référence — pour garder un affichage lisible même quand le Z brut
+    explose (ex: 60, 130...).
+
+    Transformation exponentielle saturante : score = 100 * (1 - e^(-z/K))
+    - Monotone croissante, jamais négative, plafonnée à 100 sans jamais
+      l'atteindre exactement (asymptote).
+    - K=8 calibré pour que le seuil d'alerte (Z=3) tombe autour de ~30/100
+      (signal "qui vient de déclencher"), et qu'un Z brut de 20+ soit déjà
+      proche de 90+ (signal "extrême", cohérent avec les scores 82-100
+      observés dans le rapport PDF pour les vraies anomalies).
+    """
+    z = max(z, 0.0)
+    return 100.0 * (1.0 - math.exp(-z / 8.0))
 
 
 def send_telegram(message: str):
@@ -39,16 +60,19 @@ def format_alert(symbol: str, avg_z: float, per_exchange: dict, oi_aggregate: di
     lines.append(f"Heure: {ts_str} UTC")
     lines.append(f"Direction probable: <b>{direction}</b>")
     lines.append("")
-    lines.append(f"📊 Z-score moyen (déclencheur): <b>{avg_z:.2f}</b> (seuil {config.ALERT_THRESHOLD:.2f})")
-    lines.append("Détail par exchange (score combiné / prix / volume):")
+    score100 = zscore_to_score100(avg_z)
+    lines.append(f"🧮 Score composite: <b>{score100:.1f}/100</b>")
+    lines.append(f"📊 Z-score moyen brut (déclencheur): <b>{avg_z:.2f}</b> (seuil {config.ALERT_THRESHOLD:.2f})")
+    lines.append("Détail par exchange (score /100 · combiné brut / prix / volume):")
     for ex in config.EXCHANGES:
         data = per_exchange.get(ex)
         if data is None:
             lines.append(f"  • {ex.capitalize()}: n/d (données indisponibles ce cycle)")
         else:
+            ex_score100 = zscore_to_score100(data["z_combined"])
             lines.append(
-                f"  • {ex.capitalize()}: {data['z_combined']:.2f}  "
-                f"(prix {data['z_price']:.2f} / volume {data['z_volume']:.2f})"
+                f"  • {ex.capitalize()}: {ex_score100:.1f}/100  "
+                f"(brut {data['z_combined']:.2f} · prix {data['z_price']:.2f} / volume {data['z_volume']:.2f})"
             )
     lines.append("")
     lines.append(f"💰 Open Interest agrégé (Binance+Bybit+OKX+Bitget): "
