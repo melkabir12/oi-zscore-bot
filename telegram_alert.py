@@ -3,9 +3,8 @@ Envoi de messages Telegram (alertes + notifications de statut).
 """
 import logging
 import math
-
+import time
 import requests
-
 import config
 
 log = logging.getLogger("telegram")
@@ -31,21 +30,39 @@ def zscore_to_score100(z: float) -> float:
     return 100.0 * (1.0 - math.exp(-z / 8.0))
 
 
-def send_telegram(message: str):
+def send_telegram(message: str, retries: int = 3):
+    """
+    Envoie un message Telegram avec retry automatique en cas d'échec réseau
+    (timeout, erreur de connexion, erreur serveur Telegram temporaire).
+    Sans ce retry, une alerte peut se perdre silencieusement si l'API
+    Telegram met plus de quelques secondes à répondre (cas observé: read
+    timeout après 10s sur un pic de charge).
+    """
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         log.warning("Telegram non configuré (token/chat_id manquant) — message non envoyé:\n%s", message)
         return
+
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(
-            url,
-            json={"chat_id": config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            log.error("Erreur envoi Telegram (%s): %s", r.status_code, r.text)
-    except Exception as e:
-        log.error("Exception envoi Telegram: %s", e)
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(
+                url,
+                json={"chat_id": config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                if attempt > 1:
+                    log.info("Envoi Telegram réussi à la tentative %d/%d", attempt, retries)
+                return
+            log.error("Erreur envoi Telegram (%s) tentative %d/%d: %s", r.status_code, attempt, retries, r.text)
+        except Exception as e:
+            log.error("Exception envoi Telegram tentative %d/%d: %s", attempt, retries, e)
+
+        if attempt < retries:
+            time.sleep(2)
+
+    log.error("Échec définitif envoi Telegram après %d tentatives — message perdu:\n%s", retries, message)
 
 
 def format_alert(symbol: str, avg_z: float, per_exchange: dict, oi_aggregate: dict, per_exchange_oi: dict, direction: str, ts_str: str) -> str:
@@ -60,6 +77,7 @@ def format_alert(symbol: str, avg_z: float, per_exchange: dict, oi_aggregate: di
     lines.append(f"Heure: {ts_str} UTC")
     lines.append(f"Direction probable: <b>{direction}</b>")
     lines.append("")
+
     score100 = zscore_to_score100(avg_z)
     lines.append(f"🧮 Score composite: <b>{score100:.1f}/100</b>")
     lines.append(f"📊 Z-score moyen brut (déclencheur): <b>{avg_z:.2f}</b> (seuil {config.ALERT_THRESHOLD:.2f})")
@@ -74,6 +92,7 @@ def format_alert(symbol: str, avg_z: float, per_exchange: dict, oi_aggregate: di
                 f"  • {ex.capitalize()}: {ex_score100:.1f}/100  "
                 f"(brut {data['z_combined']:.2f} · prix {data['z_price']:.2f} / volume {data['z_volume']:.2f})"
             )
+
     lines.append("")
     lines.append(f"💰 Open Interest agrégé (Binance+Bybit+OKX+Bitget): "
                   f"<b>{oi_aggregate['variation_pct']:+.2f}%</b>")
