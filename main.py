@@ -13,6 +13,10 @@ Les deux boucles partagent un état en mémoire (dernier prix connu par
 exchange/paire, dernières variations OI) pour que les alertes Z-score
 puissent afficher l'OI le plus récent disponible, sans les recoupler
 strictement dans le temps (ce serait trop fragile en cas de désync).
+
+NOUVEAU: ce bot reste silencieux (pas d'analyse, pas d'appel exchange) tant
+que le bot volume primaire n'a pas déclenché une alerte (flag partagé via
+Upstash Redis, voir redis_gate.py).
 """
 import asyncio
 import logging
@@ -26,6 +30,7 @@ from zscore import SymbolExchangeStats
 from oi_tracker import OiSeries, AggregateOiSeries
 from telegram_alert import send_telegram, format_alert
 from http_client import ExchangeFetchError
+from redis_gate import is_trigger_active
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +76,10 @@ class Bot:
         self.last_oi_result = {(ex, sym): None for ex in config.EXCHANGES for sym in config.SYMBOLS}
         self.last_oi_aggregate_result = {sym: None for sym in config.SYMBOLS}
 
+        # NOUVEAU: mémorise si le trigger était actif au cycle précédent,
+        # pour ne logger/annoncer l'activation qu'une seule fois.
+        self._was_active = False
+
     def persist(self):
         payload = {
             "zscore": {f"{ex}:{sym}": s.to_state() for (ex, sym), s in self.zscore_stats.items()},
@@ -83,6 +92,20 @@ class Bot:
     async def kline_loop(self):
         while True:
             cycle_start = time.time()
+
+            # NOUVEAU: on ne fait rien (pas d'appel exchange, pas de calcul)
+            # tant que le bot volume primaire n'a pas déclenché une alerte.
+            active = await asyncio.to_thread(is_trigger_active)
+            if not active:
+                self._was_active = False
+                elapsed = time.time() - cycle_start
+                await asyncio.sleep(max(1.0, config.KLINE_POLL_INTERVAL_SEC - elapsed))
+                continue
+
+            if not self._was_active:
+                log.info("Trigger actif détecté — activation de l'analyse Z-score/OI.")
+                self._was_active = True
+
             for symbol in config.SYMBOLS:
                 per_exchange = {}
                 for ex in config.EXCHANGES:
@@ -170,6 +193,15 @@ class Bot:
     async def oi_loop(self):
         while True:
             cycle_start = time.time()
+
+            # NOUVEAU: même logique que kline_loop — pas d'appel exchange
+            # tant que le trigger n'est pas actif.
+            active = await asyncio.to_thread(is_trigger_active)
+            if not active:
+                elapsed = time.time() - cycle_start
+                await asyncio.sleep(max(1.0, config.OI_POLL_INTERVAL_SEC - elapsed))
+                continue
+
             for symbol in config.SYMBOLS:
                 per_exchange_results = {}
                 for ex in config.EXCHANGES:
@@ -219,7 +251,8 @@ async def main():
     )
     send_telegram(
         f"✅ Bot Z-score + OI démarré — paires: {', '.join(config.SYMBOLS)} | "
-        f"exchanges: {', '.join(config.EXCHANGES)} | seuil: {config.ALERT_THRESHOLD}"
+        f"exchanges: {', '.join(config.EXCHANGES)} | seuil: {config.ALERT_THRESHOLD} | "
+        f"en veille jusqu'à déclenchement du bot volume primaire"
     )
     bot = Bot()
     await asyncio.gather(bot.kline_loop(), bot.oi_loop())
