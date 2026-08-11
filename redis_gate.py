@@ -1,8 +1,3 @@
-"""
-Vérifie l'état du flag partagé (Upstash Redis REST) qui indique si le bot
-volume (primaire) a déclenché une alerte. Tant que ce flag n'est pas actif,
-ce bot reste silencieux : pas d'appel exchange, pas de calcul Z-score.
-"""
 import logging
 import os
 import requests
