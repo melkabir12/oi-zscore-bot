@@ -9,15 +9,9 @@ Deux boucles asynchrones tournent en parallèle :
 2. Boucle OI : toutes les 5 min, récupère l'OI courant sur les 4
    exchanges × 3 paires, calcule les variations (agrégée + par exchange).
 
-Les deux boucles partagent un état en mémoire (dernier prix connu par
-exchange/paire, dernières variations OI) pour que les alertes Z-score
-puissent afficher l'OI le plus récent disponible, sans les recoupler
-strictement dans le temps (ce serait trop fragile en cas de désync).
-
 NOUVEAU: ce bot reste silencieux (pas d'analyse, pas d'appel exchange) pour
 un coin donné tant que le bot volume primaire n'a pas déclenché d'alerte
-SUR CE COIN (flag par coin via Upstash Redis, voir redis_gate.py). Chaque
-paire (BTC/ETH/XRP) est donc activée/désactivée indépendamment des autres.
+SUR CE COIN (flag par coin via Upstash Redis, voir redis_gate.py).
 """
 import asyncio
 import logging
@@ -44,7 +38,6 @@ class Bot:
     def __init__(self):
         saved = state_module.load_state()
 
-        # zscore_stats[(exchange, symbol)] = SymbolExchangeStats
         self.zscore_stats = {}
         for ex in config.EXCHANGES:
             for sym in config.SYMBOLS:
@@ -52,7 +45,6 @@ class Bot:
                 s.load_state(saved["zscore"].get(f"{ex}:{sym}"))
                 self.zscore_stats[(ex, sym)] = s
 
-        # oi_series[(exchange, symbol)] = OiSeries
         self.oi_series = {}
         for ex in config.EXCHANGES:
             for sym in config.SYMBOLS:
@@ -60,26 +52,16 @@ class Bot:
                 o.load_state(saved["oi"].get(f"{ex}:{sym}"))
                 self.oi_series[(ex, sym)] = o
 
-        # oi_aggregate[symbol] = AggregateOiSeries
         self.oi_aggregate = {}
         for sym in config.SYMBOLS:
             a = AggregateOiSeries()
             a.load_state(saved["oi_aggregate"].get(sym))
             self.oi_aggregate[sym] = a
 
-        # Dernier prix connu par (exchange, symbol), utilisé pour convertir
-        # l'OI (en coin) en notionnel USD.
         self.last_price = {}
-
-        # Dernières variations OI connues par exchange/paire (mises à jour
-        # par la boucle OI, lues par la boucle Z-score pour composer les
-        # alertes sans avoir à refaire un appel réseau synchronisé).
         self.last_oi_result = {(ex, sym): None for ex in config.EXCHANGES for sym in config.SYMBOLS}
         self.last_oi_aggregate_result = {sym: None for sym in config.SYMBOLS}
 
-        # NOUVEAU: mémorise, PAR COIN, si le trigger était actif au cycle
-        # précédent, pour ne logger/annoncer l'activation qu'une seule fois
-        # par coin.
         self._was_active = {sym: False for sym in config.SYMBOLS}
 
     def persist(self):
@@ -90,15 +72,11 @@ class Bot:
         }
         state_module.save_state(payload)
 
-    # ── Boucle Z-score (prix + volume, ~1 min) ──────────────────────
     async def kline_loop(self):
         while True:
             cycle_start = time.time()
 
             for symbol in config.SYMBOLS:
-                # NOUVEAU: on ne fait rien pour CE coin (pas d'appel
-                # exchange, pas de calcul) tant que le bot volume primaire
-                # n'a pas déclenché d'alerte sur ce coin précis.
                 active = await asyncio.to_thread(is_trigger_active, symbol)
                 if not active:
                     self._was_active[symbol] = False
@@ -121,7 +99,6 @@ class Bot:
                     self.last_price[(ex, symbol)] = kline["close"]
                     stats = self.zscore_stats[(ex, symbol)]
 
-                    # Évite de retraiter deux fois la même bougie (même ts)
                     if stats.last_ts == kline["ts"]:
                         if stats.ready:
                             per_exchange[ex] = {
@@ -152,16 +129,12 @@ class Bot:
 
     def _maybe_alert(self, symbol: str, per_exchange: dict):
         if len(per_exchange) < config.MIN_EXCHANGES_FOR_ALERT:
-            return  # pas assez d'exchanges valides ce cycle pour une moyenne fiable
+            return
 
         avg_z = sum(v["z_combined"] for v in per_exchange.values()) / len(per_exchange)
         if avg_z < config.ALERT_THRESHOLD:
             return
 
-        # Direction probable : moyenne des rendements récents disponibles,
-        # déduite du signe dominant des Z-prix (>0 = hausse anormale -> plutôt
-        # liquidation de shorts ; <0 = baisse anormale -> plutôt liquidation
-        # de longs). Approche simple et transparente.
         signed = [v["z_price"] for v in per_exchange.values()]
         avg_signed = sum(signed) / len(signed)
         if avg_signed > 0:
@@ -190,14 +163,11 @@ class Bot:
         log.info("ALERTE déclenchée pour %s (Z moyen=%.2f)", symbol, avg_z)
         send_telegram(msg)
 
-    # ── Boucle Open Interest (~5 min) ───────────────────────────────
     async def oi_loop(self):
         while True:
             cycle_start = time.time()
 
             for symbol in config.SYMBOLS:
-                # NOUVEAU: même logique que kline_loop — pas d'appel
-                # exchange pour ce coin tant que son trigger n'est pas actif.
                 active = await asyncio.to_thread(is_trigger_active, symbol)
                 if not active:
                     continue
@@ -210,9 +180,6 @@ class Bot:
                     try:
                         oi = await asyncio.to_thread(adapter.fetch_oi, ex_symbol)
                         if price is None:
-                            # Pas encore de prix connu pour cet exchange (boucle
-                            # kline pas encore passée) -> on ne peut pas calculer
-                            # de notionnel fiable ce cycle, on saute proprement.
                             log.info("[%s/%s] OI reçu mais pas encore de prix connu, notionnel reporté au prochain cycle", ex, symbol)
                             per_exchange_results[ex] = None
                             continue
