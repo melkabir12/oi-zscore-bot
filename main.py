@@ -14,9 +14,10 @@ exchange/paire, dernières variations OI) pour que les alertes Z-score
 puissent afficher l'OI le plus récent disponible, sans les recoupler
 strictement dans le temps (ce serait trop fragile en cas de désync).
 
-NOUVEAU: ce bot reste silencieux (pas d'analyse, pas d'appel exchange) tant
-que le bot volume primaire n'a pas déclenché une alerte (flag partagé via
-Upstash Redis, voir redis_gate.py).
+NOUVEAU: ce bot reste silencieux (pas d'analyse, pas d'appel exchange) pour
+un coin donné tant que le bot volume primaire n'a pas déclenché d'alerte
+SUR CE COIN (flag par coin via Upstash Redis, voir redis_gate.py). Chaque
+paire (BTC/ETH/XRP) est donc activée/désactivée indépendamment des autres.
 """
 import asyncio
 import logging
@@ -76,9 +77,10 @@ class Bot:
         self.last_oi_result = {(ex, sym): None for ex in config.EXCHANGES for sym in config.SYMBOLS}
         self.last_oi_aggregate_result = {sym: None for sym in config.SYMBOLS}
 
-        # NOUVEAU: mémorise si le trigger était actif au cycle précédent,
-        # pour ne logger/annoncer l'activation qu'une seule fois.
-        self._was_active = False
+        # NOUVEAU: mémorise, PAR COIN, si le trigger était actif au cycle
+        # précédent, pour ne logger/annoncer l'activation qu'une seule fois
+        # par coin.
+        self._was_active = {sym: False for sym in config.SYMBOLS}
 
     def persist(self):
         payload = {
@@ -93,20 +95,19 @@ class Bot:
         while True:
             cycle_start = time.time()
 
-            # NOUVEAU: on ne fait rien (pas d'appel exchange, pas de calcul)
-            # tant que le bot volume primaire n'a pas déclenché une alerte.
-            active = await asyncio.to_thread(is_trigger_active)
-            if not active:
-                self._was_active = False
-                elapsed = time.time() - cycle_start
-                await asyncio.sleep(max(1.0, config.KLINE_POLL_INTERVAL_SEC - elapsed))
-                continue
-
-            if not self._was_active:
-                log.info("Trigger actif détecté — activation de l'analyse Z-score/OI.")
-                self._was_active = True
-
             for symbol in config.SYMBOLS:
+                # NOUVEAU: on ne fait rien pour CE coin (pas d'appel
+                # exchange, pas de calcul) tant que le bot volume primaire
+                # n'a pas déclenché d'alerte sur ce coin précis.
+                active = await asyncio.to_thread(is_trigger_active, symbol)
+                if not active:
+                    self._was_active[symbol] = False
+                    continue
+
+                if not self._was_active[symbol]:
+                    log.info("[%s] Trigger actif détecté — activation de l'analyse Z-score/OI.", symbol)
+                    self._was_active[symbol] = True
+
                 per_exchange = {}
                 for ex in config.EXCHANGES:
                     ex_symbol = config.EXCHANGE_SYMBOL_MAP[ex][symbol]
@@ -194,15 +195,13 @@ class Bot:
         while True:
             cycle_start = time.time()
 
-            # NOUVEAU: même logique que kline_loop — pas d'appel exchange
-            # tant que le trigger n'est pas actif.
-            active = await asyncio.to_thread(is_trigger_active)
-            if not active:
-                elapsed = time.time() - cycle_start
-                await asyncio.sleep(max(1.0, config.OI_POLL_INTERVAL_SEC - elapsed))
-                continue
-
             for symbol in config.SYMBOLS:
+                # NOUVEAU: même logique que kline_loop — pas d'appel
+                # exchange pour ce coin tant que son trigger n'est pas actif.
+                active = await asyncio.to_thread(is_trigger_active, symbol)
+                if not active:
+                    continue
+
                 per_exchange_results = {}
                 for ex in config.EXCHANGES:
                     ex_symbol = config.EXCHANGE_SYMBOL_MAP[ex][symbol]
@@ -252,7 +251,7 @@ async def main():
     send_telegram(
         f"✅ Bot Z-score + OI démarré — paires: {', '.join(config.SYMBOLS)} | "
         f"exchanges: {', '.join(config.EXCHANGES)} | seuil: {config.ALERT_THRESHOLD} | "
-        f"en veille jusqu'à déclenchement du bot volume primaire"
+        f"en veille jusqu'à déclenchement du bot volume primaire (par coin)"
     )
     bot = Bot()
     await asyncio.gather(bot.kline_loop(), bot.oi_loop())
